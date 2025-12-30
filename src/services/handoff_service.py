@@ -5,7 +5,10 @@ This module enforces workflow rules and state transitions.
 It intentionally does not handle persistence, authentication,
 or transport concerns.
 """
+from sqlalchemy.orm import Session
+from core.database import SessionLocal
 
+from domain.models import Handoff, HandoffEvent
 from domain.state import handoffs
 from exceptions.handoff import (
     InvalidStateTransition,
@@ -17,69 +20,137 @@ from exceptions.handoff import (
 
 
 def initiate_handoff(handoff_id: int, actor: str, receiving_party: str) -> dict:
-    handoff = handoffs.get(handoff_id)
-
-    if not handoff:
-        raise HandoffNotFound()
-    if handoff["state"] != "active":
-        raise InvalidStateTransition(f"Cannot initiate transfer from state '{handoff['state']}'")
-    if handoff["current_owner"] != actor:
-        raise UnauthorizedActor(f"Initiating party '{actor}' unauthorized")
-    handoff["state"] = "pending"
-    handoff["initiated_by"] = actor
-    handoff["receiving_party"] = receiving_party
+    db: Session = SessionLocal()
+    try:
+        handoff = db.get(Handoff, handoff_id)
+        if not handoff:
+            raise HandoffNotFound()
+        if handoff.state != "active":
+            raise InvalidStateTransition(f"Cannot accept transfer from state '{handoff['state']}'")
+        if handoff.current_owner != actor:
+            raise UnauthorizedActor(f"Receiving party '{actor}' unauthorized")
+        
+        handoff.state = "pending"
+        handoff.receiving_party = receiving_party
+        
+        event = HandoffEvent(
+            handoff_id = handoff.id,
+            action = "initiate",
+            actor = actor,
+            from_state = "active",
+            to_state = "pending",
+        )
+        db.add(event)
+        
+        db.commit()
+        db.refresh(handoff)
+        return handoff
     
-    handoff["events"].append({
-        "action": "initiate",
-        "actor": actor,
-        "from_state": "active",
-        "to_state": "pending",
-        "to": receiving_party
-    })
-    
-    return handoff
+    except Exception:
+        db.rollback()
+        raise
+        
+    finally:
+        db.close()
 
 def accept_handoff(handoff_id: int, actor: str) -> dict:
-    handoff = handoffs.get(handoff_id)
+    db: Session = SessionLocal()
+    try:
+        handoff = db.get(Handoff, handoff_id)
+        if not handoff:
+            raise HandoffNotFound()
+        if handoff.state != "pending":
+            raise InvalidStateTransition(f"Cannot accept transfer from state '{handoff['state']}'")
+        if handoff.receiving_party != actor:
+            raise UnauthorizedActor(f"Receiving party '{actor}' unauthorized")
+        
+        previous_owner = handoff.current_owner
+        
+        handoff.current_owner = actor
+        handoff.state = "active"
+        handoff.receiving_party = None
+        
+        event = HandoffEvent(
+            handoff_id = handoff.id,
+            action = "accept",
+            actor = actor,
+            from_state = "pending",
+            to_state = "active",
+            previous_owner = previous_owner,
+            new_owner = actor,
+        )
+        db.add(event)
+        
+        db.commit()
+        db.refresh(handoff)
+        return handoff
     
-    if not handoff:
-        raise HandoffNotFound()
-    if handoff["state"] != "pending":
-        raise InvalidStateTransition(f"Cannot accept transfer from state '{handoff['state']}'")
-    if handoff["receiving_party"] != actor:
-        raise UnauthorizedActor(f"Receiving party '{actor}' unauthorized")
+    except Exception:
+        db.rollback()
+        raise
     
-    previous_owner = handoff["current_owner"]
-    handoff["state"] = "accepted"
-    handoff["current_owner"] = actor
-    handoff["events"].append({
-        "action": "accept",
-        "actor": actor,
-        "from_state": "pending",
-        "to_state": "accepted",
-        "previous_owner": previous_owner,
-        "new_owner": actor
-    })
-    
-    return handoff
+    finally:
+        db.close()
 
 def decline_handoff(handoff_id: int, actor: str) -> dict:
-    handoff = handoffs.get(handoff_id)
+    db: Session = SessionLocal()
+    try:
+        handoff = db.get(Handoff, handoff_id)
+        if not handoff:
+            raise HandoffNotFound()
+        if handoff.state != "pending":
+            raise InvalidStateTransition(f"Cannot accept transfer from state '{handoff['state']}'")
+        if handoff.current_owner != actor:
+            raise UnauthorizedActor(f"Receiving party '{actor}' unauthorized")
+        
+        handoff.state = "active"
+        handoff.receiving_party = None
     
-    if not handoff:
-        raise HandoffNotFound()
-    if handoff["state"] != "pending":
-        raise InvalidStateTransition(f"Cannot decline transfer from state '{handoff['state']}'")
-    if handoff["receiving_party"] != actor:
-        raise UnauthorizedActor(f"Receiving party '{actor}' unauthorized")
+        event = HandoffEvent(
+            handoff_id = handoff.id,
+            action = "decline",
+            actor = actor,
+            from_state = "pending",
+            to_state = "active",
+        )
+        db.add(event)
+        
+        db.commit()
+        db.refresh(handoff)
+        return handoff
     
-    handoff["receiving_party"] = None
-    handoff["state"] = "active"
-    handoff["events"].append({
-        "action": "decline",
-        "actor": actor,
-        "from_state": "pending",
-        "to_state": "active",
-    })
+    except Exception:
+        db.rollback()
+        raise
     
-    return handoff
+    finally:
+        db.close()
+
+def create_handoff(current_owner: str) -> Handoff:
+    db: Session = SessionLocal()
+    try:
+        handoff = Handoff(
+            current_owner=current_owner,
+            state="active",
+        )
+        db.add(handoff)
+        db.flush()
+        
+        event = HandoffEvent(
+            handoff_id=handoff.id,
+            action="create",
+            actor=current_owner,
+            to_state="active",
+        )
+        db.add(event)
+        
+        db.commit()
+        db.refresh(handoff)
+        return handoff
+    
+    except Exception:
+        db.rollback()
+        raise
+    
+    finally:
+        db.close()

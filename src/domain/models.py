@@ -16,7 +16,7 @@ class Handoff(Base):
     id = Column(Integer, primary_key=True)
     
     current_owner = Column(Text, nullable=False)
-    receiving_party = Column(Text, nullable=False)
+    receiving_party = Column(Text, nullable=True)
     
     state = Column(Text, nullable=False)
     
