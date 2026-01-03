@@ -9,38 +9,39 @@ from sqlalchemy.orm import Session
 from core.database import SessionLocal
 
 from domain.models import Handoff, HandoffEvent
-from domain.state import handoffs
 from exceptions.handoff import (
     InvalidStateTransition,
     UnauthorizedActor,
     HandoffNotFound
 )
 
+from domain.enums import HandoffAction
+from domain.enums import HandoffState
+
 # TODO: create repo abstractions
+# define enums...
 
 
 def initiate_handoff(handoff_id: int, actor: str, receiving_party: str) -> dict:
     db: Session = SessionLocal()
     try:
-        handoff = db.get(Handoff, handoff_id)
-        if not handoff:
-            raise HandoffNotFound()
-        if handoff.state != "active":
+        handoff = get_handoff_for_update(db, handoff_id)
+        if handoff.state != HandoffState.ACTIVE:
             raise InvalidStateTransition(f"Cannot accept transfer from state '{handoff['state']}'")
         if handoff.current_owner != actor:
-            raise UnauthorizedActor(f"Receiving party '{actor}' unauthorized")
+            raise UnauthorizedActor("Cannot initiate transfer")
         
-        handoff.state = "pending"
+        handoff.state = HandoffState.PENDING
         handoff.receiving_party = receiving_party
         
-        event = HandoffEvent(
-            handoff_id = handoff.id,
-            action = "initiate",
-            actor = actor,
-            from_state = "active",
-            to_state = "pending",
+        record_event(
+            db,
+            handoff,
+            action=HandoffAction.INITIATE,
+            actor=actor,
+            from_state=HandoffState.ACTIVE,
+            to_state=HandoffState.PENDING,
         )
-        db.add(event)
         
         db.commit()
         db.refresh(handoff)
@@ -56,30 +57,28 @@ def initiate_handoff(handoff_id: int, actor: str, receiving_party: str) -> dict:
 def accept_handoff(handoff_id: int, actor: str) -> dict:
     db: Session = SessionLocal()
     try:
-        handoff = db.get(Handoff, handoff_id)
-        if not handoff:
-            raise HandoffNotFound()
-        if handoff.state != "pending":
+        handoff = get_handoff_for_update(db, handoff_id)
+        if handoff.state != HandoffState.PENDING:
             raise InvalidStateTransition(f"Cannot accept transfer from state '{handoff['state']}'")
         if handoff.receiving_party != actor:
-            raise UnauthorizedActor(f"Receiving party '{actor}' unauthorized")
+            raise UnauthorizedActor("Cannot accept transfer")
         
         previous_owner = handoff.current_owner
         
         handoff.current_owner = actor
-        handoff.state = "active"
+        handoff.state = HandoffState.ACTIVE
         handoff.receiving_party = None
         
-        event = HandoffEvent(
-            handoff_id = handoff.id,
-            action = "accept",
-            actor = actor,
-            from_state = "pending",
-            to_state = "active",
-            previous_owner = previous_owner,
-            new_owner = actor,
+        record_event(
+            db,
+            handoff,
+            action=HandoffAction.ACCEPT,
+            actor=actor,
+            from_state=HandoffState.PENDING,
+            to_state=HandoffState.ACTIVE,
+            previous_owner=previous_owner,
+            new_owner=actor,
         )
-        db.add(event)
         
         db.commit()
         db.refresh(handoff)
@@ -95,25 +94,23 @@ def accept_handoff(handoff_id: int, actor: str) -> dict:
 def decline_handoff(handoff_id: int, actor: str) -> dict:
     db: Session = SessionLocal()
     try:
-        handoff = db.get(Handoff, handoff_id)
-        if not handoff:
-            raise HandoffNotFound()
-        if handoff.state != "pending":
+        handoff = get_handoff_for_update(db, handoff_id)
+        if handoff.state != HandoffState.PENDING:
             raise InvalidStateTransition(f"Cannot accept transfer from state '{handoff['state']}'")
-        if handoff.current_owner != actor:
-            raise UnauthorizedActor(f"Receiving party '{actor}' unauthorized")
+        if handoff.receiving_party != actor:
+            raise UnauthorizedActor("Cannot decline transfer")
         
-        handoff.state = "active"
+        handoff.state = HandoffState.ACTIVE
         handoff.receiving_party = None
-    
-        event = HandoffEvent(
-            handoff_id = handoff.id,
-            action = "decline",
-            actor = actor,
-            from_state = "pending",
-            to_state = "active",
+        
+        record_event(
+            db,
+            handoff,
+            action=HandoffAction.DECLINE,
+            actor=actor,
+            from_state=HandoffState.PENDING,
+            to_state=HandoffState.ACTIVE,
         )
-        db.add(event)
         
         db.commit()
         db.refresh(handoff)
@@ -131,18 +128,18 @@ def create_handoff(current_owner: str) -> Handoff:
     try:
         handoff = Handoff(
             current_owner=current_owner,
-            state="active",
+            state=HandoffState.ACTIVE,
         )
         db.add(handoff)
         db.flush()
         
-        event = HandoffEvent(
-            handoff_id=handoff.id,
-            action="create",
+        record_event(
+            db,
+            handoff,
+            action=HandoffAction.CREATE,
             actor=current_owner,
-            to_state="active",
+            to_state=HandoffState.ACTIVE,
         )
-        db.add(event)
         
         db.commit()
         db.refresh(handoff)
@@ -154,3 +151,44 @@ def create_handoff(current_owner: str) -> Handoff:
     
     finally:
         db.close()
+
+# no locking
+def get_handoff(handoff_id: int) -> Handoff:
+    db: Session = SessionLocal()
+    try:
+        handoff = db.query(Handoff).filter(Handoff.id == handoff_id).one_or_none()
+        if handoff is None:
+            raise HandoffNotFound(f"Handoff {handoff_id} not found")
+        return handoff
+    finally:
+        db.close()
+        
+def get_handoff_for_update(db: Session, handoff_id: int) -> Handoff:
+    handoff = (db.query(Handoff).filter(Handoff.id == handoff_id)
+               .with_for_update().one_or_none())
+    if handoff is None:
+        raise HandoffNotFound(f"Handoff {handoff_id} not found")
+    return handoff
+
+def record_event(db: Session, handoff: Handoff, *, action: HandoffAction, actor: str,
+                 from_state: HandoffState | None = None, to_state: HandoffState, 
+                 previous_owner: str | None = None, new_owner: str | None = None) -> None:
+    event = HandoffEvent(
+        handoff_id=handoff.id,
+        action=action,
+        actor=actor,
+        from_state=from_state,
+        to_state=to_state,
+        previous_owner=previous_owner,
+        new_owner=new_owner,
+    )
+    db.add(event)
+    
+def assert_transition_allowed():
+    pass
+
+def cancel_pending_handoff():
+    pass
+
+def list_handoffs_for_user():
+    pass

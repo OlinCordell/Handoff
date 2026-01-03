@@ -9,3 +9,9 @@ class UnauthorizedActor(HandoffError):
 
 class HandoffNotFound(HandoffError):
     pass
+
+class DuplicateAction(HandoffError):
+    pass
+
+class InvalidHandoffState(HandoffError):
+    pass
